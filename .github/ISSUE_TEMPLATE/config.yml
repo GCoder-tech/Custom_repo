@@ -1,5 +1,5 @@
 name: "Create Repository"
-description: "Use this issue to request a new GitHub Product repository"
+description: "Use this issue to request a new GitHub repository"
 title: "Repository creation request"
 labels: ["repo-creation"]
 - type: dropdown
@@ -16,27 +16,6 @@ labels: ["repo-creation"]
       - DBTVS
       - BPS
       - DBUS
-  validations:
-    required: true
-body:
-- type: markdown
-  attributes:
-    value: |
-      This should read: "Please enter the Solution Asset ID associated with your team's [GitHub Product Code](https://wiki.fisglobal.com/display/cmtech/GHE+-+Team+Onboarding#GHETeamOnboarding-GitHubProductCode) and the name, description, BUC code to create a repository."
-- type: input
-  id: asset-id
-  attributes:
-    label: Asset ID 
-    description: Enter the asset id of the Product **(mandatory)**
-    placeholder: "12226"
-  validations:
-    required: true
-- type: input
-  id: buc
-  attributes:
-    label: BUC Code
-    description: Enter the BUC code **(mandatory)**
-    placeholder: "xxxx.xxxx.xxxx"
   validations:
     required: true
 - type: input
@@ -62,7 +41,7 @@ body:
 - type: textarea
   id: repo-description
   attributes:
-    label: Repo Description
+    label: Repository Description
     description: Describe the use of the repository and what it will hold **(mandatory)**
   validations:
     required: true
