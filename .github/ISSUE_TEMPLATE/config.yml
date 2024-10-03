@@ -1,0 +1,68 @@
+name: "Create Repository"
+description: "Use this issue to request a new GitHub Product repository"
+title: "Repository creation request"
+labels: ["repo-creation"]
+- type: dropdown
+  id: value stream key
+  attributes:
+    label: value stream key
+    multiple: false
+    description: Please select the value stream key
+    default: 0
+    options:
+      - DEE
+      - DRCB
+      - DLFI
+      - DBTVS
+      - BPS
+      - DBUS
+  validations:
+    required: true
+body:
+- type: markdown
+  attributes:
+    value: |
+      This should read: "Please enter the Solution Asset ID associated with your team's [GitHub Product Code](https://wiki.fisglobal.com/display/cmtech/GHE+-+Team+Onboarding#GHETeamOnboarding-GitHubProductCode) and the name, description, BUC code to create a repository."
+- type: input
+  id: asset-id
+  attributes:
+    label: Asset ID 
+    description: Enter the asset id of the Product **(mandatory)**
+    placeholder: "12226"
+  validations:
+    required: true
+- type: input
+  id: buc
+  attributes:
+    label: BUC Code
+    description: Enter the BUC code **(mandatory)**
+    placeholder: "xxxx.xxxx.xxxx"
+  validations:
+    required: true
+- type: input
+  id: repo-name
+  attributes:
+    label: Repository Name
+    description: Enter the name of the repository(max 60 chars and no special characters) **(mandatory)**
+    placeholder: ex. ui
+  validations:
+    required: true
+- type: dropdown
+  id: visibility
+  attributes:
+    label: Visibility
+    multiple: false
+    description: Please select the visibility **(default is private)**
+    default: 0
+    options:
+      - private
+      - internal
+  validations:
+    required: true
+- type: textarea
+  id: repo-description
+  attributes:
+    label: Repo Description
+    description: Describe the use of the repository and what it will hold **(mandatory)**
+  validations:
+    required: true
