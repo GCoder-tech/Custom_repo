@@ -1,11 +1,4 @@
-name: Handle IssueOps Tickets
-
-on:
-  issues:
-    types: [opened,reopened]
-
-jobs:
-  # create-team:
+3  # create-team:
   #   if: contains(github.event.issue.labels.*.name, 'team-creation')
   #   runs-on: ubuntu-arm-2-8
 
