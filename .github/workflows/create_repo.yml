@@ -1,27 +1,836 @@
-name: Create Repository from Issue
+name: Handle IssueOps Tickets
 
 on:
   issues:
-    types: [opened]
+    types: [opened,reopened]
 
 jobs:
-  create_repo:
-    runs-on: ubuntu-latest
+  create-team:
+    if: contains(github.event.issue.labels.*.name, 'team-creation')
+    runs-on: ubuntu-arm-2-8
+
     steps:
-      - name: Extract issue form data
-        id: form_data
-        run: |
-          echo "REPO_NAME=$(echo '${{ github.event.issue.body }}' | grep 'Repository Name' | cut -d ':' -f 2 | xargs)" >> $GITHUB_ENV
-          echo "VISIBILITY=$(echo '${{ github.event.issue.body }}' | grep 'Visibility' | cut -d ':' -f 2 | xargs)" >> $GITHUB_ENV
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Create repository via API
-        run: |
-          curl -X POST \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/orgs/YOUR_ORG/repos \
-            -d "{\"name\": \"$REPO_NAME\", \"private\": $( [ \"$VISIBILITY\" = 'Private' ] && echo true || echo false )}"
+      - name: Parse issue body
+        id: issue-parser
+        uses: stefanbuck/github-issue-parser@v3
 
+      - name: Display parsed result
+        run: cat ${HOME}/issue-parser-result.json
+        
+      - name: Add Labels
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            github.rest.issues.addLabels({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['issueOps']
+            })
+
+      - name: Find parent team
+        id: get_team_object
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            const org_name =context.repo.owner;
+            const team_slug = '${{ steps.issue-parser.outputs.issueparser_parent_team_name }}';
+            try {
+              return await github.rest.teams.getByName({
+                org: org_name,
+                team_slug: team_slug,
+              });
+            } catch (error) {
+              console.log("Team not found");
+              return;
+            }
+          result-encoding: json
+      
+      - name: Verify parent team exists
         env:
-          REPO_NAME: ${{ env.REPO_NAME }}
-          VISIBILITY: ${{ env.VISIBILITY }}
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          if [ -z "${{ steps.get_team_object.outputs.result }}" ]; then
+            echo "👷🏼‍♂️ FIS_IssueOps Error: Parent Team ${{ steps.issue-parser.outputs.issueparser_parent_team_name }} does not exist. Ticket will be closed, please ensure parent team exists before creating child team."| gh issue comment ${{ github.event.issue.number }} --repo ${{ github.repository }} --body-file=-
+            exit 1
+          fi
+      
+      - name: Get Parent Team prefix
+        id: get-prefix
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          parent_team_name_prefix=$(echo "${{ steps.issue-parser.outputs.issueparser_parent_team_name }}" | cut -d'-' -f1 | tr '[:upper:]' '[:lower:]')
+          echo "parent_team_name_prefix=$parent_team_name_prefix" >> $GITHUB_OUTPUT
+
+      - name: Search for first maintainer login
+        id: get-maintainer-one
+        uses: ./.github/actions/get-login-by-email
+        with: 
+          github-token: ${{ secrets.PAT }}
+          input-email: ${{ steps.issue-parser.outputs.issueparser_first_maintainer_email }}
+
+      - name: Set maintainer one login as output
+        id: set-maintainer-one-login
+        env:
+          GH_TOKEN: ${{ secrets.MY_PAT }}
+        run: |
+          if [ ! -s github_login.txt ]; then
+            echo "👷🏼‍♂️ FIS_IssueOps Error: Could not find a GitHub Login corresponding to email ${{ steps.issue-parser.outputs.issueparser_first_maintainer_email }}. Please check you have specified the correct email and the user does exist in GitHub. Ticket will be closed, please create new ticket with correct info."| gh issue comment ${{ github.event.issue.number }} --repo ${{ github.repository }} --body-file=-
+            exit 1
+          fi
+          echo "github_login=$(cat github_login.txt)" >> $GITHUB_OUTPUT
+          rm -f github_login.txt
+
+      - name: Search for second maintainer login
+        id: get-maintainer-two
+        uses: ./.github/actions/get-login-by-email
+        with: 
+          github-token: ${{ secrets.PAT }}
+          input-email: ${{ steps.issue-parser.outputs.issueparser_second_maintainer_email }}
+
+      - name: Set maintainer two login as output
+        id: set-maintainer-two-login
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          if [ ! -s github_login.txt ]; then
+            echo "👷🏼‍♂️ FIS_IssueOps Error: Could not find a GitHub Login corresponding to email ${{ steps.issue-parser.outputs.issueparser_second_maintainer_email }}. Please check you have specified the correct email and the user does exist in GitHub. Ticket will be closed, please create new ticket with correct info."| gh issue comment ${{ github.event.issue.number }} --repo ${{ github.repository }} --body-file=-
+            exit 1
+          fi
+          echo "github_login=$(cat github_login.txt)" >> $GITHUB_OUTPUT
+          rm -f github_login.txt
+
+      - name: Verify the two maintainers provided aren't the same
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          if [ '${{ steps.set-maintainer-one-login.outputs.github_login }}' == '${{ steps.set-maintainer-two-login.outputs.github_login }}' ]; then
+            echo "👷🏼‍♂️ FIS_IssueOps Error: The maintainers for the team should be different. Please check you have specified the correct email addresses and they are different from each other."| gh issue comment ${{ github.event.issue.number }} --repo ${{ github.repository }} --body-file=-
+            exit 1
+          fi
+      
+      - name: Verify child team name doesn't contain spaces or underscores
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          if [[ "${{ steps.issue-parser.outputs.issueparser_child_team_name }}" =~ [[:space:]] ]]; then
+            echo "👷🏼‍♂️ FIS_IssueOps Error: Child Team Name should not contain spaces. Ticket will be closed, please create new ticket with correct info."| gh issue comment ${{ github.event.issue.number }} --repo ${{ github.repository }} --body-file=-
+            exit 1
+          fi
+          if [[ "${{ steps.issue-parser.outputs.issueparser_child_team_name }}" =~ [_] ]]; then
+            echo "👷🏼‍♂️ FIS_IssueOps Error: Child Team Name should not contain underscores. Ticket will be closed, please create new ticket with correct info."| gh issue comment ${{ github.event.issue.number }} --repo ${{ github.repository }} --body-file=-
+            exit 1
+          fi
+
+      - name: Create child-team via API
+        id: create-team
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            var team_name = `${{ steps.get-prefix.outputs.parent_team_name_prefix}}-${{ steps.issue-parser.outputs.issueparser_child_team_name }}-team`
+            github.rest.teams.create({
+              org: context.repo.owner,
+              name: `${team_name}`,
+              privacy: 'closed',
+              parent_team_id: ${{ fromJSON(steps.get_team_object.outputs.result).data.id }}
+              })
+            core.setOutput("team_name", team_name);
+      
+      - name: Add maintainer one to team
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            github.rest.teams.addOrUpdateMembershipForUserInOrg({
+              org: context.repo.owner,
+              team_slug: '${{ steps.create-team.outputs.team_name }}',
+              username: '${{ steps.set-maintainer-one-login.outputs.github_login }}',
+              role: "maintainer"
+            });
+
+      - name: Add maintainer two to team
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            github.rest.teams.addOrUpdateMembershipForUserInOrg({
+              org: context.repo.owner,
+              team_slug: '${{ steps.create-team.outputs.team_name }}',
+              username: '${{ steps.set-maintainer-two-login.outputs.github_login }}',
+              role: "maintainer"
+            });
+
+      - uses: actions/github-script@v7
+        name: Comment on ticket
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '👷🏼‍♂️ FIS_IssueOps: Child Team ${{ steps.create-team.outputs.team_name }} has been created! \n https://github.com/orgs/Capital-Markets/teams/${{ steps.create-team.outputs.team_name }}'
+            })
+
+      - uses: actions/github-script@v7
+        name: Close ticket
+        if: always()
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            github.rest.issues.update({
+              issue_number: context.issue.number,
+              title: 'Child Team creation request: ${{ steps.create-team.outputs.team_name }}',
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed'
+            })
+
+
+  create-repo:
+    if: contains(github.event.issue.labels.*.name, 'repo-creation')
+    runs-on: ubuntu-latest-2-8
+
+    steps:
+      - name: Parse issue body
+        uses: stefanbuck/github-issue-parser@v3
+        id: issue-parser
+      - name: Validate parsed result
+        id: parse
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "buc_code=${{ steps.issue-parser.outputs.issueparser_buc_code }}"
+          echo "repository_name=${{ steps.issue-parser.outputs.issueparser_repository_name }}"
+          echo "repo_description=$(echo "${{ steps.issue-parser.outputs.issueparser_repo_description }}" | sed 's/"/\\"/g')"
+
+          if [ -z "${{ steps.issue-parser.outputs.issueparser_buc_code }}" ]; then
+            echo "👷🏼‍♂️ FIS_IssueOps Error: BUC Code is required. Ticket will be closed, please create new ticket with correct info."| gh issue comment ${{ github.event.issue.number }} --repo ${{ github.repository }} --body-file=-
+            exit 1
+          fi
+          if [ -z "${{ steps.issue-parser.outputs.issueparser_repository_name }}" ]; then
+            echo "👷🏼‍♂️ FIS_IssueOps Error: Repository Name is required. Ticket will be closed, please create new ticket with correct info."| gh issue comment ${{ github.event.issue.number }} --repo ${{ github.repository }} --body-file=-
+            exit 1
+          fi
+          if [ -z "${{ steps.issue-parser.outputs.issueparser_repo_description }}" ]; then
+            echo "👷🏼‍♂️ FIS_IssueOps Error: Repository Description is required. Ticket will be closed, please create new ticket with correct info."| gh issue comment ${{ github.event.issue.number }} --repo ${{ github.repository }} --body-file=-
+            exit 1
+          fi
+      - name: Get token
+        id: get_token
+        uses: microsoftgraph/get-app-token@main
+        with:
+          application-id: ${{ secrets.APP_ID }}
+          application-private-key: ${{ secrets.PRIVATE_KEY }}
+
+      - name: Add Labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.addLabels({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['issueOps']
+            })
+      - name: Query Quickbase and populate topics
+        id: quickbase
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+            curl -X POST 'https://api.quickbase.com/v1/records/query' \
+            -H 'QB-Realm-Hostname: fisglobal.quickbase.com' \
+            -H 'User-Agent: test' \
+            -o data.json \
+            -H 'Authorization: QB-USER-TOKEN ${{ secrets.QB_TOKEN }}' \
+            -H 'Content-Type: application/json' \
+            -d '{"from": "bste4e4th","select": [35],"where": "{6.EX.${{ steps.issue-parser.outputs.issueparser_asset_id }}}","options": {"skip": 0,"top": 0,"compareWithAppLocalTime": false}}'
+            asset_name=$(jq -r '.data[] | ."35" | .value' data.json)
+            echo "asset_name=$asset_name" >> "$GITHUB_OUTPUT"
+            if [ -z "$asset_name" ]; then
+              echo "👷🏼‍♂️ FIS_IssueOps Error: Asset ID not found in Quickbase. Ticket will be closed, please create new ticket with correct info."| gh issue comment ${{ github.event.issue.number }} --repo ${{ github.repository }} --body-file=-
+              exit 1
+            fi
+
+      - name: Check if github team exists
+        uses: actions/github-script@v7
+        id: checkTeam
+        if: steps.quickbase.outcome == 'success'
+        continue-on-error: true
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            const result = await github.rest.teams.getByName({
+              org: context.repo.owner,
+              team_slug: '${{ steps.quickbase.outputs.asset_name }}-admin-team'
+            });
+      - name: Check if LDAP team exists
+        uses: actions/github-script@v7
+        id: checkLdapTeam
+        if: steps.checkTeam.outcome == 'failure'
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            try {
+              const result = await github.rest.teams.getByName({
+                org: context.repo.owner,
+                team_slug: '${{ steps.quickbase.outputs.asset_name }}-fnfis-admin-team'
+              });
+              return result.data.id
+            } catch (error) {
+              github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '👷🏼‍♂️ FIS_IssueOps: Error: ${{ steps.quickbase.outputs.asset_name }} Team does not exist. Ticket will be closed, please ensure teams for ${{ steps.quickbase.outputs.asset_name }} are created before attempting to create a repository via Issue Ops.'
+              })
+              core.setFailed('Error: ${{ steps.quickbase.outputs.asset_name }} Team does not exist')
+            }
+
+      - name: Extract and sanitize repo description
+        id: sanitize
+        run: |
+          sanitized_description=$(echo ${{ toJSON(steps.issue-parser.outputs.issueparser_repo_description) }} | sed 's/\\r\\n/ /g' | sed 's/\\n/ /g')
+          echo "SANITIZED_DESCRIPTION=$sanitized_description" >> $GITHUB_ENV
+
+      - uses: actions/github-script@v7
+        name: Create repo via API
+        if: steps.checkLdapTeam.outcome == 'success'|| steps.checkTeam.outcome == 'success'
+        id: createRepo
+        env:
+          SANITIZED_DESCRIPTION: ${{ env.SANITIZED_DESCRIPTION }}
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            github.rest.repos.createUsingTemplate({
+              template_owner: context.repo.owner,
+              template_repo: 'CM-TemplateRepository',
+              owner: context.repo.owner,
+              private: true,
+              description: process.env.SANITIZED_DESCRIPTION,
+              name: '${{ steps.quickbase.outputs.asset_name }}-${{ steps.issue-parser.outputs.issueparser_repository_name }}',
+            })
+
+      - uses: actions/github-script@v7
+        name: Update visibility repo via API
+        id: updateVisibility
+        if: steps.createRepo.outcome == 'success'
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            github.rest.repos.update({
+              owner: context.repo.owner,
+              repo: '${{ steps.quickbase.outputs.asset_name }}-${{ steps.issue-parser.outputs.issueparser_repository_name }}',
+              visibility: '${{ steps.issue-parser.outputs.issueparser_visibility }}',
+              })
+      - run: sleep 5
+      - uses: actions/github-script@v7
+        name: Add topics
+        id: addTopics
+        if: steps.createRepo.outcome == 'success'
+        env:
+          SOLUTION_NAME: ${{ steps.quickbase.outputs.solution_name }}
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            github.rest.repos.replaceAllTopics({
+              owner: context.repo.owner,
+              repo: '${{ steps.quickbase.outputs.asset_name }}-${{ steps.issue-parser.outputs.issueparser_repository_name }}',
+              names: ['${{ steps.issue-parser.outputs.issueparser_asset_id }}']
+            })
+      - run: sleep 5
+      - uses: actions/github-script@v7
+        name: Add github teams to repo
+        id: addOrUpdatePermissions
+        continue-on-error: true
+        if: steps.checkTeam.outcome == 'success' && steps.createRepo.outcome == 'success'
+        env:
+          SOLUTION_NAME: ${{ steps.quickbase.outputs.solution_name }}
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            github.rest.teams.addOrUpdateRepoPermissionsInOrg({
+              org: context.repo.owner,
+              team_slug: '${{ steps.quickbase.outputs.asset_name }}-admin-team',
+              owner: context.repo.owner,
+              repo: '${{ steps.quickbase.outputs.asset_name }}-${{ steps.issue-parser.outputs.issueparser_repository_name }}',
+              permission: 'admin'
+            })
+            github.rest.teams.addOrUpdateRepoPermissionsInOrg({
+              org: context.repo.owner,
+              team_slug: '${{ steps.quickbase.outputs.asset_name }}-read-team',
+              owner: context.repo.owner,
+              repo: '${{ steps.quickbase.outputs.asset_name }}-${{ steps.issue-parser.outputs.issueparser_repository_name }}',
+              permission: 'pull'
+            })
+            github.rest.teams.addOrUpdateRepoPermissionsInOrg({
+              org: context.repo.owner,
+              team_slug: '${{ steps.quickbase.outputs.asset_name }}-write-team',
+              owner: context.repo.owner,
+              repo: '${{ steps.quickbase.outputs.asset_name }}-${{ steps.issue-parser.outputs.issueparser_repository_name }}',
+              permission: 'push'
+            })
+      - run: sleep 5
+      - uses: actions/github-script@v7
+        name: Add FIS LDAP teams to repo
+        id: addOrUpdateFISPermissions
+        continue-on-error: true
+        env:
+          SOLUTION_NAME: ${{ steps.quickbase.outputs.solution_name }}
+        if: steps.checkLdapTeam.outcome == 'success' && steps.createRepo.outcome == 'success'
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            github.rest.teams.addOrUpdateRepoPermissionsInOrg({
+              org: context.repo.owner,
+              team_slug: '${{ steps.quickbase.outputs.asset_name }}-fnfis-admin-team',
+              owner: context.repo.owner,
+              repo: '${{ steps.quickbase.outputs.asset_name }}-${{ steps.issue-parser.outputs.issueparser_repository_name }}',
+              permission: 'admin'
+            })
+            github.rest.teams.addOrUpdateRepoPermissionsInOrg({
+              org: context.repo.owner,
+              team_slug: '${{ steps.quickbase.outputs.asset_name }}-fnfis-read-team',
+              owner: context.repo.owner,
+              repo: '${{ steps.quickbase.outputs.asset_name }}-${{ steps.issue-parser.outputs.issueparser_repository_name }}'
+            })
+            github.rest.teams.addOrUpdateRepoPermissionsInOrg({
+              org: context.repo.owner,
+              team_slug: '${{ steps.quickbase.outputs.asset_name }}-fnfis-write-team',
+              owner: context.repo.owner,
+              permission: 'write',
+              repo: '${{ steps.quickbase.outputs.asset_name }}-${{ steps.issue-parser.outputs.issueparser_repository_name }}'
+            })
+      # - uses: actions/github-script@v7
+      #   name: Add Custom Properties
+      #   with:
+      #     github-token: ${{ secrets.PAT }}
+      #     script: |
+      #       github.rest.repos.createOrUpdateCustomPropertiesValues({
+      #         owner: context.repo.owner,
+      #         repo: '${{ steps.quickbase.outputs.asset_name }}-${{ steps.issue-parser.outputs.issueparser_repository_name }}',
+      #         properties: [
+      #           {
+      #             property_name: 'AssetID',
+      #             value: '${{ steps.issue-parser.outputs.issueparser_asset_id }}'
+      #           },
+      #           {
+      #             property_name: 'BUC',
+      #             value: '${{ steps.issue-parser.outputs.issueparser_buc_code }}'
+      #           }
+      #         ]
+      #       })
+      - uses: actions/github-script@v7
+        name: Comment on success
+        id: comment_success
+        if: steps.createRepo.outcome == 'success'
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '👷🏼‍♂️ FIS_IssueOps: Repo (${{ steps.quickbase.outputs.asset_name }}-${{ steps.issue-parser.outputs.issueparser_repository_name }}) has been created! \n https://github.com/Capital-Markets/${{ steps.quickbase.outputs.asset_name }}-${{ steps.issue-parser.outputs.issueparser_repository_name }}'
+            })
+      - uses: actions/github-script@v7
+        name: Close ticket
+        if: always()
+        with:
+          script: |
+            github.rest.issues.update({
+              issue_number: context.issue.number,
+              title: 'Repository creation request: ${{ steps.quickbase.outputs.asset_name }}-${{ steps.issue-parser.outputs.issueparser_repository_name }}',
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed'
+            })
+
+  
+  caas-onboarding:
+    if: contains(github.event.issue.labels.*.name, 'caas-onboarding')
+    runs-on: ubuntu-latest-2-8
+
+    steps:
+      - name: Parse issue body
+        uses: stefanbuck/github-issue-parser@v3
+        id: issue-parser
+
+      - name: Display parsed result
+        run: cat ${HOME}/issue-parser-result.json
+
+      - name: Convert product-code to lowercase
+        id: convert-product-code
+        run: |
+            raw_code="${{ steps.issue-parser.outputs.issueparser_productcode }}"
+            echo "product_code=${raw_code,,}" >> $GITHUB_OUTPUT
+
+      - uses: actions/create-github-app-token@v1.9.3
+        id: app-token
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Add Labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.addLabels({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['issueOps']
+            })
+
+      - name: Create read-team
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            github.rest.teams.create({
+              org: 'Capital-Markets',
+              name: '${{ steps.convert-product-code.outputs.product_code }}-read-team',
+              privacy: 'closed'
+              })
+
+      - name: Get read-team Id
+        uses: actions/github-script@v7
+        id: get-read-team-id
+        with:
+          github-token: ${{ secrets.PAT }}
+          debug: true
+          script: |
+            const result = await github.rest.teams.getByName({
+              org: 'Capital-Markets',
+              team_slug: '${{ steps.convert-product-code.outputs.product_code }}-read-team'
+            });
+            return result.data.id
+
+      - name: Create write-team
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            github.rest.teams.create({
+              org: 'Capital-Markets',
+              name: '${{ steps.convert-product-code.outputs.product_code }}-write-team',
+              privacy: 'closed',
+              parent_team_id: ${{ steps.get-read-team-id.outputs.result }}
+              })
+
+      - name: Create admin-team
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            github.rest.teams.create({
+              org: 'Capital-Markets',
+              name: '${{ steps.convert-product-code.outputs.product_code }}-admin-team',
+              privacy: 'closed',
+              parent_team_id: ${{ steps.get-read-team-id.outputs.result }}
+              })
+
+      - name: Get first maintainer username
+        uses: actions/github-script@v7
+        id: get-maintainer-one
+        with:
+          github-token: ${{ secrets.PAT }}
+          debug: true
+          script: |
+            const query = `query {
+              search(query: "in:email ${{ steps.issue-parser.outputs.issueparser_maintainerone }}", type:USER, first: 1) {
+                nodes {
+                  ... on User {
+                    login email
+                  }
+                }
+              }
+            }`;
+            const result = await github.graphql(query)
+            console.log(result.search.nodes[0].login)
+            return result.search.nodes[0].login
+
+      - name: Get second maintainer username
+        uses: actions/github-script@v7
+        id: get-maintainer-two
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            const query = `query {
+              search(query: "in:email ${{ steps.issue-parser.outputs.issueparser_maintainertwo }}", type:USER, first: 1) {
+                nodes {
+                  ... on User {
+                    login email
+                  }
+                }
+              }
+            }`;
+            const result = await github.graphql(query)
+            console.log(result.search.nodes[0].login)
+            return result.search.nodes[0].login
+
+      - name: Add maintainer one to teams
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            github.rest.teams.addOrUpdateMembershipForUserInOrg({
+              org: 'Capital-Markets',
+              team_slug: '${{ steps.convert-product-code.outputs.product_code }}-read-team',
+              username: ${{ steps.get-maintainer-one.outputs.result }},
+              role: "maintainer"
+            });
+
+            github.rest.teams.addOrUpdateMembershipForUserInOrg({
+              org: 'Capital-Markets',
+              team_slug: '${{ steps.convert-product-code.outputs.product_code }}-write-team',
+              username: ${{ steps.get-maintainer-one.outputs.result }},
+              role: "maintainer"
+            });
+
+            github.rest.teams.addOrUpdateMembershipForUserInOrg({
+              org: 'Capital-Markets',
+              team_slug: '${{ steps.convert-product-code.outputs.product_code }}-admin-team',
+              username: ${{ steps.get-maintainer-one.outputs.result }},
+              role: "maintainer"
+            });
+
+      - name: Add maintainer two to teams
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            github.rest.teams.addOrUpdateMembershipForUserInOrg({
+              org: 'Capital-Markets',
+              team_slug: '${{ steps.convert-product-code.outputs.product_code }}-read-team',
+              username: ${{ steps.get-maintainer-two.outputs.result }},
+              role: "maintainer"
+            });
+
+            github.rest.teams.addOrUpdateMembershipForUserInOrg({
+              org: 'Capital-Markets',
+              team_slug: '${{ steps.convert-product-code.outputs.product_code }}-write-team',
+              username: ${{ steps.get-maintainer-two.outputs.result }},
+              role: "maintainer"
+            });
+
+            github.rest.teams.addOrUpdateMembershipForUserInOrg({
+              org: 'Capital-Markets',
+              team_slug: '${{ steps.convert-product-code.outputs.product_code }}-admin-team',
+              username: ${{ steps.get-maintainer-two.outputs.result }},
+              role: "maintainer"
+            });
+
+      - name: Comment on ticket
+        uses: actions/github-script@v7
+        with:
+          script: |
+            var maintainer_one = ${{ steps.get-maintainer-one.outputs.result }}.replace("\"", "")
+            var maintainer_two = ${{ steps.get-maintainer-two.outputs.result }}.replace("\"", "")
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `Hello,\n\n${{ steps.convert-product-code.outputs.product_code }} has been successfully onboarded onto GHE.\n\nThe following teams have been created: ${{ steps.convert-product-code.outputs.product_code }}-read-team, ${{ steps.convert-product-code.outputs.product_code }}-write-team, ${{ steps.convert-product-code.outputs.product_code }}-admin-team.\n\nUsers @${ maintainer_one } and @${ maintainer_two } have been granted maintainer privileges to administer these teams and their members.\n\nFor next steps and more information, please visit the GHE Wiki here: https://wiki.fnis.com/display/cmtech/GHE+-+Getting+Started`
+            })
+
+      - name: Close ticket
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.update({
+              issue_number: context.issue.number,
+              title: 'CaaS Onboarding - ${{ steps.convert-product-code.outputs.product_code }}',
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed'
+            })
+
+  add-bypass-member:
+    if: contains(github.event.issue.labels.*.name, 'commit-signed-bypass')
+    runs-on: ubuntu-arm-2-8
+    steps:
+      - name: Parse issue body
+        uses: stefanbuck/github-issue-parser@v3
+        id: issue-parser
+
+      - name: Display parsed result
+        run: cat ${HOME}/issue-parser-result.json
+
+      - name: Checkout repository
+        uses: actions/checkout@6d193bf28034eafb982f37bd894289fe649468fc
+
+      - name: Check if input is email or username
+        env:
+          USER_INPUT: ${{ steps.issue-parser.outputs.issueparser_user_name_or_email_address }}
+        id: check_email
+        run: |
+          regex="^[a-z0-9!#\$%&'*+/=?^_\`{|}~-]+(\.[a-z0-9!#$%&'*+/=?^_\`{|}~-]+)*@([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?\$"
+          input="$USER_INPUT"
+          if [[ "$input" =~ $regex ]] ; then
+             echo "user_email=true" >> $GITHUB_ENV
+          else
+             echo "user_email=false" >> $GITHUB_ENV
+          fi
+      - name: Search for member login
+        if: env.user_email == 'true'
+        id: get-maintainer-two
+        uses: ./.github/actions/get-login-by-email
+        with: 
+          github-token: ${{ secrets.PAT }}
+          input-email: ${{ steps.issue-parser.outputs.issueparser_user_name_or_email_address }}
+      
+      - name: Set maintainer two login as output
+        if: env.user_email == 'true'
+        id: set-maintainer-two-login
+        env:
+            GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+            if [ ! -s github_login.txt ]; then
+              echo "👷🏼‍♂️ FIS_IssueOps Error: Could not find a GitHub Login corresponding to email ${{ steps.issue-parser.outputs.issueparser_user_name_or_email_address }}. Please check you have specified the correct email and the user does exist in GitHub. Ticket will be closed, please create new ticket with correct info."| gh issue comment ${{ github.event.issue.number }} --repo ${{ github.repository }} --body-file=-
+              exit 1
+            fi
+            echo "github_login=$(cat github_login.txt)" >> $GITHUB_OUTPUT
+            echo "$github_login"
+            rm -f github_login.txt
+      
+      - name: Add user into bypass team
+        if: env.user_email == 'true'
+        uses: actions/github-script@35b1cdd1b2c1fc704b1cd9758d10f67e833fcb02
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+                github.rest.teams.addOrUpdateMembershipForUserInOrg({
+                  org: context.repo.owner,
+                  team_slug: 'cm-bypass-team',
+                  username: '${{ steps.set-maintainer-two-login.outputs.github_login }}',
+                  role: "member"   
+                });
+      
+      - uses: actions/create-github-app-token@3378cda945da322a8db4b193e19d46352ebe2de5
+        if: env.user_email == 'false'
+        id: app-token
+        with:
+          app-id: ${{ secrets.CM_ISSUEOPS_APP_ID }}
+          private-key: ${{ secrets.CM_ISSUEOPS_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+      
+      - name: check if user name is valid
+        if: env.user_email == 'false'
+        env:  
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          status_code=$(curl -s -o /dev/null -w "%{http_code}" \
+          -H "Authorization: Bearer $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          https://api.github.com/users/${{ steps.issue-parser.outputs.issueparser_user_name_or_email_address }})
+          echo "Status code: $status_code"
+          if [ "$status_code" -eq 200 ]; then
+            echo "user_exists=true" >> $GITHUB_ENV
+          else
+            echo "user_exists=false" >> $GITHUB_ENV
+          fi
+      
+      - name: Add user into bypass team
+        if: env.user_email == 'false' && env.user_exists == 'true'
+        uses: actions/github-script@35b1cdd1b2c1fc704b1cd9758d10f67e833fcb02
+        with:
+            github-token: ${{ secrets.PAT }}
+            script: |
+              github.rest.teams.addOrUpdateMembershipForUserInOrg({
+                org: context.repo.owner,
+                team_slug: 'cm-bypass-team',
+                username: '${{ steps.issue-parser.outputs.issueparser_user_name_or_email_address }}',
+                role: "member"
+              });
+      
+
+         
+      - uses: actions/github-script@35b1cdd1b2c1fc704b1cd9758d10f67e833fcb02
+        name: Comment on ticket
+        if: env.user_exists == 'true'
+        with:
+            script: |
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: '👷🏼‍♂️ FIS_IssueOps: User ${{ steps.issue-parser.outputs.issueparser_user_name_or_email_address }} has been added to the commit signed bypass group for 48 hours!'
+              })
+      - uses: actions/github-script@35b1cdd1b2c1fc704b1cd9758d10f67e833fcb02
+        name: Comment on ticket on invalid user
+        if: env.user_exists == 'false'
+        with:
+            script: |
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: '👷🏼‍♂️ FIS_IssueOps: User ${{ steps.issue-parser.outputs.issueparser_user_name_or_email_address }} is invalid'
+              })
+      - uses: actions/github-script@35b1cdd1b2c1fc704b1cd9758d10f67e833fcb02
+        name: Close ticket
+        if: env.user_exists == 'true'
+        with:
+          script: |
+                  github.rest.issues.update({
+                    issue_number: context.issue.number,
+                    title: 'Commit signed bypass group addition request: ${{ steps.issue-parser.outputs.issueparser_user_name_or_email_address }}',
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    state: 'closed'
+                  })
+
+  add-bulk-member:
+     if: contains(github.event.issue.labels.*.name, 'bulk-add-member')
+     runs-on: ubuntu-arm-2-8
+     steps:
+          - name: Parse issue body
+            uses: stefanbuck/github-issue-parser@v3
+            id: issue-parser
+
+          - name: Display parsed result
+            run: cat ${HOME}/issue-parser-result.json
+
+          - name: Checkout repository
+            uses: actions/checkout@6d193bf28034eafb982f37bd894289fe649468fc
+
+          - name: Run a one-line script
+            run: chmod +x ./bulk_add_member.sh
+
+          # Runs a set of commands using the runners shell
+          - name: Run a multi-line script
+            env:
+              GH_TOKEN: ${{ secrets.PAT }}
+            run: |
+                 ./bulk_add_member.sh ./user_list.csv ${{ steps.issue-parser.outputs.issueparser_organisation_name }} ${{ steps.issue-parser.outputs.issueparser_team_name }}
+    
+          - uses: actions/github-script@35b1cdd1b2c1fc704b1cd9758d10f67e833fcb02
+            name: Comment on ticket
+            with:
+                script: |
+                  github.rest.issues.createComment({
+                    issue_number: context.issue.number,
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    body: '👷🏼‍♂️ FIS_IssueOps: User(s) has been added into this ${{ steps.issue-parser.outputs.issueparser_organisation_name }} s team ${{ steps.issue-parser.outputs.issueparser_team_name }}'
+                  })
+          - uses: actions/github-script@35b1cdd1b2c1fc704b1cd9758d10f67e833fcb02
+            name: Close ticket
+            with:
+              script: |
+                      github.rest.issues.update({
+                        issue_number: context.issue.number,
+                        title: 'bulk add member request:',
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        state: 'closed'
+                      })
